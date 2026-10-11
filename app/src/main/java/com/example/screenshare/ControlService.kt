@@ -4,7 +4,10 @@ import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.GestureDescription
 import android.content.Intent
 import android.graphics.Path
+import android.os.Build
+import android.os.Bundle
 import android.view.accessibility.AccessibilityEvent
+import android.view.accessibility.AccessibilityNodeInfo
 
 class ControlService : AccessibilityService() {
     companion object { @Volatile var instance: ControlService? = null }
@@ -21,4 +24,21 @@ class ControlService : AccessibilityService() {
             .addStroke(GestureDescription.StrokeDescription(p, 0, dur.coerceAtLeast(1))).build()
         dispatchGesture(g, null, null)
     }
+
+    private fun currentText(node: AccessibilityNodeInfo): String {
+        if (Build.VERSION.SDK_INT >= 26 && node.isShowingHintText) return ""
+        return node.text?.toString() ?: ""
+    }
+
+    private fun setText(newText: (String) -> String) {
+        val node = rootInActiveWindow?.findFocus(AccessibilityNodeInfo.FOCUS_INPUT) ?: return
+        val args = Bundle().apply {
+            putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, newText(currentText(node)))
+        }
+        node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
+    }
+
+    /** Escribe en el campo de texto que tenga el foco en el celular. */
+    fun typeText(s: String) = setText { it + s }
+    fun deleteChar() = setText { it.dropLast(1) }
 }
