@@ -23,6 +23,8 @@ import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
 import android.net.wifi.WifiManager
 import android.os.Build
+import android.util.DisplayMetrics
+import android.view.Display
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.IBinder
@@ -35,6 +37,7 @@ import java.io.IOException
 import java.io.InputStreamReader
 import java.net.ServerSocket
 import java.net.Socket
+import java.net.URLDecoder
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
@@ -57,6 +60,14 @@ class ScreenService : Service() {
     @Volatile private var frame: ByteArray? = null
     @Volatile private var frameId = 0L
     private var bmp: Bitmap? = null
+    private lateinit var handler: Handler
+    private var curW = 0
+    private var curH = 0
+    private val displayListener = object : DisplayManager.DisplayListener {
+        override fun onDisplayAdded(displayId: Int) {}
+        override fun onDisplayRemoved(displayId: Int) {}
+        override fun onDisplayChanged(displayId: Int) { if (displayId == Display.DEFAULT_DISPLAY) resizeIfNeeded() }
+    }
     private var lastTs = 0L
     private val audioClients = CopyOnWriteArrayList<LinkedBlockingQueue<ByteArray>>()
 
@@ -82,42 +93,73 @@ class ScreenService : Service() {
         val mgr = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
         projection = mgr.getMediaProjection(code, data)
         worker = HandlerThread("capture").also { it.start() }
-        val handler = Handler(worker!!.looper)
+        handler = Handler(worker!!.looper)
         projection!!.registerCallback(object : MediaProjection.Callback() {
             override fun onStop() { stopSelf() }
         }, handler)
 
-        val m = resources.displayMetrics
-        val scale = minOf(1f, 720f / m.widthPixels)
-        val w = ((m.widthPixels * scale).toInt() / 2) * 2
-        val h = ((m.heightPixels * scale).toInt() / 2) * 2
+        val m = realMetrics()
+        val (w, h) = fit(m)
+        curW = w; curH = h
+        reader = makeReader(w, h)
+        display = projection!!.createVirtualDisplay(
+            "share", w, h, m.densityDpi, DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+            reader!!.surface, null, handler
+        )
+        (getSystemService(DISPLAY_SERVICE) as DisplayManager).registerDisplayListener(displayListener, handler)
 
-        reader = ImageReader.newInstance(w, h, PixelFormat.RGBA_8888, 2)
-        reader!!.setOnImageAvailableListener({ r ->
-            val img = r.acquireLatestImage() ?: return@setOnImageAvailableListener
+        running = true
+        startAudio()
+        startServer()
+        return START_NOT_STICKY
+    }
+
+    @Suppress("DEPRECATION")
+    private fun realMetrics(): DisplayMetrics {
+        val dm = DisplayMetrics()
+        (getSystemService(DISPLAY_SERVICE) as DisplayManager).getDisplay(Display.DEFAULT_DISPLAY).getRealMetrics(dm)
+        return dm
+    }
+
+    /** Tamaño de captura: el lado largo se limita a 1280 px (sirve en vertical y horizontal). */
+    private fun fit(m: DisplayMetrics): Pair<Int, Int> {
+        val sc = minOf(1f, 1280f / maxOf(m.widthPixels, m.heightPixels))
+        return Pair(((m.widthPixels * sc).toInt() / 2) * 2, ((m.heightPixels * sc).toInt() / 2) * 2)
+    }
+
+    private fun makeReader(w: Int, h: Int): ImageReader {
+        val r = ImageReader.newInstance(w, h, PixelFormat.RGBA_8888, 2)
+        r.setOnImageAvailableListener({ ir ->
+            val img = ir.acquireLatestImage() ?: return@setOnImageAvailableListener
             try {
                 val now = System.currentTimeMillis()
                 if (now - lastTs < 40) return@setOnImageAvailableListener
                 lastTs = now
                 val p = img.planes[0]
                 val bw = p.rowStride / p.pixelStride
-                if (bmp == null || bmp!!.width != bw) bmp = Bitmap.createBitmap(bw, h, Bitmap.Config.ARGB_8888)
+                if (bmp == null || bmp!!.width != bw || bmp!!.height != h) bmp = Bitmap.createBitmap(bw, h, Bitmap.Config.ARGB_8888)
                 bmp!!.copyPixelsFromBuffer(p.buffer)
                 val out = ByteArrayOutputStream()
                 Bitmap.createBitmap(bmp!!, 0, 0, w, h).compress(Bitmap.CompressFormat.JPEG, 60, out)
                 synchronized(lock) { frame = out.toByteArray(); frameId++; lock.notifyAll() }
             } finally { img.close() }
         }, handler)
+        return r
+    }
 
-        display = projection!!.createVirtualDisplay(
-            "share", w, h, m.densityDpi, DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
-            reader!!.surface, null, handler
-        )
-
-        running = true
-        startAudio()
-        startServer()
-        return START_NOT_STICKY
+    /** Si el celular gira, ajusta la captura al nuevo tamaño. */
+    private fun resizeIfNeeded() {
+        try {
+            val m = realMetrics()
+            val (w, h) = fit(m)
+            if (w == curW && h == curH) return
+            val nr = makeReader(w, h)
+            display?.surface = nr.surface
+            display?.resize(w, h, m.densityDpi)
+            val old = reader
+            reader = nr; curW = w; curH = h
+            old?.close()
+        } catch (_: Exception) {}
     }
 
     private fun startAsForeground() {
@@ -239,30 +281,34 @@ class ScreenService : Service() {
                             }
                         } finally { audioClients.remove(qu) }
                     }
-                    "/ctl" -> { control(q); reply(out, "200 OK", "text/plain", "ok".toByteArray()) }
+                    "/ctl" -> { val ok = control(q); reply(out, "200 OK", "text/plain", (if (ok) "ok" else "nocontrol").toByteArray()) }
                     else -> reply(out, "200 OK", "text/html; charset=utf-8", assets.open("index.html").readBytes())
                 }
             }
         } catch (_: Exception) {}
     }
 
-    private fun control(q: Map<String, String>) {
-        val m = resources.displayMetrics
+    private fun control(q: Map<String, String>): Boolean {
+        if (q["t"] == "mute") {
+            val am = getSystemService(AUDIO_SERVICE) as AudioManager
+            am.adjustStreamVolume(AudioManager.STREAM_MUSIC,
+                if (q["v"] == "1") AudioManager.ADJUST_MUTE else AudioManager.ADJUST_UNMUTE, 0)
+            return true
+        }
+        val cs = ControlService.instance ?: return false
+        val m = realMetrics()
         val W = m.widthPixels; val H = m.heightPixels
         fun f(n: String) = (q[n]?.toFloatOrNull() ?: 0f).coerceIn(0f, 1f)
-        val cs = ControlService.instance
         when (q["t"]) {
-            "tap" -> cs?.gesture(f("x") * W, f("y") * H, f("x") * W, f("y") * H, 50)
-            "swipe" -> cs?.gesture(f("x") * W, f("y") * H, f("x2") * W, f("y2") * H, q["d"]?.toLongOrNull() ?: 300)
-            "back" -> cs?.performGlobalAction(AccessibilityService.GLOBAL_ACTION_BACK)
-            "home" -> cs?.performGlobalAction(AccessibilityService.GLOBAL_ACTION_HOME)
-            "recents" -> cs?.performGlobalAction(AccessibilityService.GLOBAL_ACTION_RECENTS)
-            "mute" -> {
-                val am = getSystemService(AUDIO_SERVICE) as AudioManager
-                am.adjustStreamVolume(AudioManager.STREAM_MUSIC,
-                    if (q["v"] == "1") AudioManager.ADJUST_MUTE else AudioManager.ADJUST_UNMUTE, 0)
-            }
+            "tap" -> cs.gesture(f("x") * W, f("y") * H, f("x") * W, f("y") * H, 50)
+            "swipe" -> cs.gesture(f("x") * W, f("y") * H, f("x2") * W, f("y2") * H, q["d"]?.toLongOrNull() ?: 300)
+            "back" -> cs.performGlobalAction(AccessibilityService.GLOBAL_ACTION_BACK)
+            "home" -> cs.performGlobalAction(AccessibilityService.GLOBAL_ACTION_HOME)
+            "recents" -> cs.performGlobalAction(AccessibilityService.GLOBAL_ACTION_RECENTS)
+            "type" -> cs.typeText(URLDecoder.decode(q["s"] ?: "", "UTF-8"))
+            "del" -> cs.deleteChar()
         }
+        return true
     }
 
     override fun onDestroy() {
@@ -270,6 +316,7 @@ class ScreenService : Service() {
         synchronized(lock) { lock.notifyAll() }
         try { server?.close() } catch (_: IOException) {}
         try { audioRec?.stop(); audioRec?.release() } catch (_: Exception) {}
+        try { (getSystemService(DISPLAY_SERVICE) as DisplayManager).unregisterDisplayListener(displayListener) } catch (_: Exception) {}
         display?.release()
         reader?.close()
         projection?.stop()
