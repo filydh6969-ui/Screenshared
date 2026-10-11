@@ -6,36 +6,59 @@ body{display:flex;flex-direction:column}
 #bar{display:flex;gap:6px;padding:6px;background:#222;align-items:center;flex-wrap:wrap}
 button{background:#333;color:#eee;border:0;padding:6px 12px;border-radius:6px;cursor:pointer}
 button.on{background:#2a7}
-#v{flex:1;display:flex;align-items:center;justify-content:center;min-height:0}
-img{max-width:100%;max-height:100%;touch-action:none;user-select:none;-webkit-user-drag:none}
+input{background:#333;color:#eee;border:0;padding:6px;border-radius:6px;width:160px}
+#msg{color:#fb4}
+#v{flex:1;min-height:0}
+img{width:100%;height:100%;object-fit:contain;display:block;touch-action:none;user-select:none;-webkit-user-drag:none}
 </style></head><body>
 <div id="bar">
   <button id="back">◀ Atrás</button><button id="home">● Inicio</button><button id="rec">▣ Recientes</button>
+  <input id="txt" placeholder="Escribir en el celular"><button id="snd">Enviar</button><button id="del">⌫</button>
+  <span id="msg"></span>
   <span style="flex:1"></span>
+  <button id="fs">⛶ Pantalla completa</button>
   Audio en: <button id="aPhone" class="on">Celular</button><button id="aPc">Laptop</button>
 </div>
 <div id="v"><img id="s" draggable="false"></div>
 <script>
 var K=new URLSearchParams(location.search).get('k')||'';
 var $=function(i){return document.getElementById(i)};
-function ctl(q){fetch('/ctl?k='+K+'&'+q).catch(function(){})}
+function clamp(v){return Math.min(1,Math.max(0,v))}
+function ctl(q){fetch('/ctl?k='+K+'&'+q).then(function(r){return r.text()}).then(function(t){
+  $('msg').textContent=(t==='nocontrol')?'⚠ Activa Accesibilidad en el celular':'';}).catch(function(){})}
 var img=$('s'); img.src='/stream?k='+K;
 
 ['back','home'].forEach(function(t){$(t).onclick=function(){ctl('t='+t)}});
 $('rec').onclick=function(){ctl('t=recents')};
+$('fs').onclick=function(){document.fullscreenElement?document.exitFullscreen():document.documentElement.requestFullscreen()};
+function send(){var v=$('txt').value;if(!v)return;ctl('t=type&s='+encodeURIComponent(v));$('txt').value='';}
+$('snd').onclick=send;
+$('txt').onkeydown=function(e){if(e.key==='Enter')send();};
+$('del').onclick=function(){ctl('t=del')};
 
-// Control táctil: toque, pulsación larga y deslizamiento
+// Posición real dentro de la imagen (object-fit: contain deja bordes vacíos)
+function pos(e){
+  var r=img.getBoundingClientRect(),nw=img.naturalWidth||1,nh=img.naturalHeight||1;
+  var s=Math.min(r.width/nw,r.height/nh),iw=nw*s,ih=nh*s;
+  var ox=r.left+(r.width-iw)/2,oy=r.top+(r.height-ih)/2;
+  return [clamp((e.clientX-ox)/iw),clamp((e.clientY-oy)/ih),iw,ih];
+}
 var d=null;
-function pos(e){var r=img.getBoundingClientRect();
-  return [Math.min(1,Math.max(0,(e.clientX-r.left)/r.width)),Math.min(1,Math.max(0,(e.clientY-r.top)/r.height)),r];}
 img.addEventListener('pointerdown',function(e){img.setPointerCapture(e.pointerId);d={p:pos(e),t:Date.now()}});
 img.addEventListener('pointerup',function(e){
   if(!d)return; var p=pos(e),dt=Date.now()-d.t,a=d.p; d=null;
-  var moved=Math.hypot((p[0]-a[0])*p[2].width,(p[1]-a[1])*p[2].height)>12;
+  var moved=Math.hypot((p[0]-a[0])*p[2],(p[1]-a[1])*p[3])>12;
   if(moved) ctl('t=swipe&x='+a[0]+'&y='+a[1]+'&x2='+p[0]+'&y2='+p[1]+'&d='+Math.min(1500,Math.max(150,dt)));
   else if(dt>500) ctl('t=swipe&x='+a[0]+'&y='+a[1]+'&x2='+a[0]+'&y2='+a[1]+'&d='+Math.min(dt,2000));
   else ctl('t=tap&x='+a[0]+'&y='+a[1]);
 });
+// Rueda del mouse = desplazar
+var lw=0;
+img.addEventListener('wheel',function(e){
+  e.preventDefault(); var n=Date.now(); if(n-lw<250)return; lw=n;
+  var p=pos(e),dy=e.deltaY>0?-0.2:0.2;
+  ctl('t=swipe&x='+p[0]+'&y='+clamp(p[1]-dy)+'&x2='+p[0]+'&y2='+clamp(p[1]+dy)+'&d=200');
+},{passive:false});
 
 // Audio en la laptop (PCM 16 bit, 48 kHz, estéreo)
 var ctx=null,ab=null,nt=0;
